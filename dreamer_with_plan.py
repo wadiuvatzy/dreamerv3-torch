@@ -99,7 +99,6 @@ class Dreamer(nn.Module):
         if self._step < self._config.planning_start:
             policy_output, state = self._policy(obs, state, training)
         else:
-            print("start planning")
             policy_output, state = self._policy_with_plan(obs, state, training)
 
         if training:
@@ -289,7 +288,8 @@ class Dreamer(nn.Module):
         self.a_loss_optim.zero_grad()
         a_t = copy(action)
         next_latent = self._wm.dynamics.img_step(cur_latent, a_t)
-        value = self._task_behavior.value(next_latent).mode()
+        next_feat = self._wm.dynamics.get_feat(next_latent)
+        value = self._task_behavior.value(next_feat).mode()
         for params in self._task_behavior.parameters():
             params.requires_grad = False
         value_cost = -value
