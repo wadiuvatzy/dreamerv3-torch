@@ -208,6 +208,7 @@ class RSSM(nn.Module):
     def img_step(self, prev_state, prev_action, sample=True):
         # (batch, stoch, discrete_num)
         prev_stoch = prev_state["stoch"]
+        # import pdb; pdb.set_trace()
         if self._discrete:
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
             # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
@@ -225,6 +226,7 @@ class RSSM(nn.Module):
         x = self._img_out_layers(x)
         # (batch, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("ims", x)
+        # import pdb; pdb.set_trace()
         if sample:
             stoch = self.get_dist(stats).sample()
         else:

@@ -20,10 +20,27 @@ from parallel import Parallel, Damy
 import torch
 from torch import nn
 from torch import distributions as torchd
+import re
+from copy import deepcopy, copy
+import theseus as th
 
 
 to_np = lambda x: x.detach().cpu().numpy()
 
+def linear_schedule(schdl, step):
+	"""
+	Outputs values following a linear decay schedule.
+	Adapted from https://github.com/facebookresearch/drqv2
+	"""
+	try:
+		return float(schdl)
+	except ValueError:
+		match = re.match(r'linear\((.+),(.+),(.+),(.+)\)', schdl)
+		if match:
+			init, final, start, duration = [float(g) for g in match.groups()]
+			mix = np.clip((step - start) / duration, 0.0, 1.0)
+			return (1.0 - mix) * init + mix * final
+	raise NotImplementedError(schdl)
 
 class Dreamer(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
@@ -55,6 +72,8 @@ class Dreamer(nn.Module):
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
 
+        self.a_loss_optim = torch.optim.Adam(self.parameters(), lr=config.aug_lr)
+
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
         if training:
@@ -76,7 +95,12 @@ class Dreamer(nn.Module):
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
 
-        policy_output, state = self._policy(obs, state, training)
+        # policy_output, state = self._policy(obs, state, training)
+        if self._step < self._config.planning_start:
+            policy_output, state = self._policy(obs, state, training)
+        else:
+            print("start planning")
+            policy_output, state = self._policy_with_plan(obs, state, training)
 
         if training:
             self._step += len(reset)
@@ -103,7 +127,6 @@ class Dreamer(nn.Module):
         else:
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
-        assert action.shape[0] == 4
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
@@ -111,10 +134,25 @@ class Dreamer(nn.Module):
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
-        import pdb; pdb.set_trace()
         policy_output = {"action": action, "logprob": logprob}
         state = (latent, action)
         return policy_output, state
+    
+    def _get_logprob(self, obs, state, action_input):
+        if state is None:
+            latent = action = None
+        else:
+            latent, action = state
+        obs = self._wm.preprocess(obs)
+        embed = self._wm.encoder(obs)
+        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        if self._config.eval_state_mean:
+            latent["stoch"] = latent["mean"]
+        feat = self._wm.dynamics.get_feat(latent)
+        actor = self._task_behavior.actor(feat)
+        logprob = actor.log_prob(action_input)
+        # import pdb; pdb.set_trace()
+        return logprob
 
     def _train(self, data):
         metrics = {}
@@ -133,7 +171,135 @@ class Dreamer(nn.Module):
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
+            
 
+    def _policy_with_plan(self, obs, state, training=False):
+        if state is None:
+            latent = action = None
+        else:
+            latent, action = state
+
+        original_obs = copy(obs)
+        original_state = copy(state)
+        # maybe add more update of dynamics and encoder and reward 
+        # BACK_PLAN mode in theseus
+        obs = self._wm.preprocess(obs)
+        embed = self._wm.encoder(obs)
+        cur_latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        feat = self._wm.dynamics.get_feat(cur_latent)
+
+        horizon = int(min(self._config.planning_horizon, linear_schedule(self._config.planning_horizon_schedule, self._step)))
+
+        with torch.no_grad():
+            pi_actions = torch.empty(horizon, 4, self._config.num_actions, device=self._config.device)
+            current_latent = copy(cur_latent)
+            for t in range(horizon):
+                feat = self._wm.dynamics.get_feat(current_latent)
+                actor = self._task_behavior.actor(feat)
+                a = actor.mode()
+                pi_actions[t] = a
+                # current_latent = self._wm.dynamics.imagine_with_action(a, current_latent)
+                current_latent = self._wm.dynamics.img_step(current_latent, a)
+        pi_actions = pi_actions.view(1, -1)
+        init_actions = copy(pi_actions)
+
+        actions = torch.zeros(horizon, 4, self._config.num_actions, device=self._config.device)
+        if hasattr(self, '_prev_actions'):
+            actions[:-1] = self._prev_actions[1:]
+        actions = actions.view(1, -1)
+
+        actions = th.Vector(tensor=actions, name="actions")
+        # import pdb; pdb.set_trace()
+        latent_stoch = th.Vector(tensor=cur_latent["stoch"].view(1, -1), name="latent_stoch")
+        latent_deter = th.Vector(tensor=cur_latent["deter"].view(1, -1), name="latent_deter")
+        latent_logit = th.Vector(tensor=cur_latent["logit"].view(1, -1), name="latent_logit")
+
+        for params in self._wm.parameters():
+            params.requires_grad = False
+
+        def value_cost_fn(optim_vars, aux_vars):
+            latent_stoch, latent_deter, latent_logit = aux_vars
+            latent = {"stoch": latent_stoch.tensor.reshape([4, 32, 32]), "deter": latent_deter.tensor.reshape([4, 512]), "logit": latent_logit.tensor.reshape([4, 32, 32])}
+            actions = optim_vars[0].tensor.view(horizon, 4, self._config.num_actions)
+            actions = torch.clamp(actions, -1, 1)
+            G, discount = 0, 1
+            for t in range(horizon):
+                feat = self._wm.dynamics.get_feat(latent)
+                reward = self._wm.heads["reward"](feat).mode()
+                G += discount * reward
+                discount *= self._config.discount
+                latent = self._wm.dynamics.img_step(latent, actions[t], sample=False)
+
+            feat = self._wm.dynamics.get_feat(latent)
+            G += discount * self._task_behavior.value(feat).mode()
+            err = -G.nan_to_num_(0) + 2000
+            err = torch.sum(err).view(1, -1)
+            # print("err", err)
+            return err 
+        
+        optim_vars = [actions]
+        aux_vars = [latent_stoch, latent_deter, latent_logit]
+        cost_function = th.AutoDiffCostFunction(
+			optim_vars, value_cost_fn, 1, aux_vars=aux_vars, name="value_cost_fn", 
+			#autograd_mode=th.AutogradMode.LOOP_BATCH
+		)
+        objective = th.Objective()
+        objective.to(device=self._config.device, dtype=torch.float32)
+        objective.add(cost_function)
+        optimizer = th.LevenbergMarquardt(
+			objective,
+			th.CholeskyDenseSolver,
+            max_iterations=self._config.planning_iters,
+            step_size=self._config.planning_step_size,
+        )
+        theseus_optim = th.TheseusLayer(optimizer)
+        theseus_optim.to(device=self._config.device, dtype=torch.float32)
+        theseus_inputs = {
+            "actions": init_actions,
+            "latent_stoch": cur_latent["stoch"].view(1, -1),
+            "latent_deter": cur_latent["deter"].view(1, -1),
+            "latent_logit": cur_latent["logit"].view(1, -1),
+        }  
+        updated_inputs, info = theseus_optim.forward(
+            theseus_inputs, optimizer_kwargs={"track_best_solution": True, 
+        "verbose": False, "damping": self._config.planning_damping, "backward_mode": self._config.planning_backward_mode, "backward_num_iterations": self._config.planning_backward_num_iterations,})
+
+        updated_actions = updated_inputs['actions']
+        best_actions = info.best_solution['actions']
+        best_actions = best_actions.view(horizon, 4, self._config.num_actions)
+        self._prev_actions = best_actions
+        # logprob = self._get_logprob(obs, state, best_actions[0].nan_to_num_(0))
+
+        action = best_actions[0].nan_to_num_(0).to(self._config.device)
+        action = torch.clamp(action, -1, 1)
+        logprob = self._get_logprob(original_obs, original_state, action)
+        policy_output = {"action": action, "logprob": logprob}
+        state = (cur_latent, action)
+
+        # print("init actions", init_actions)
+        # print("best actions", best_actions)
+
+        for params in self._wm.parameters():
+            params.requires_grad = True
+
+        if not training:
+            return policy_output, state
+
+        # update model
+        self.a_loss_optim.zero_grad()
+        a_t = copy(action)
+        next_latent = self._wm.dynamics.img_step(cur_latent, a_t)
+        value = self._task_behavior.value(next_latent).mode()
+        for params in self._task_behavior.parameters():
+            params.requires_grad = False
+        value_cost = -value
+        value_cost.backward()
+        self.a_loss_optim.step()
+        for params in self._task_behavior.parameters():
+            params.requires_grad = True
+
+
+        return policy_output, state
 
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
@@ -318,7 +484,6 @@ def main(config):
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
-        print("Start training.")
         state = tools.simulate(
             agent,
             train_envs,
@@ -346,7 +511,7 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
     configs = yaml.safe_load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
+        (pathlib.Path(sys.argv[0]).parent / "configs_with_plan.yaml").read_text()
     )
 
     def recursive_update(base, update):

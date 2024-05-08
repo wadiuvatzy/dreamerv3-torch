@@ -9,6 +9,7 @@ import time
 import random
 
 import numpy as np
+from copy import deepcopy
 
 import torch
 from torch import nn
@@ -316,7 +317,11 @@ def from_generator(generator, batch_size):
             data[key] = []
             for i in range(batch_size):
                 data[key].append(batch[i][key])
-            data[key] = np.stack(data[key], 0)
+            try:
+                data[key] = np.stack(data[key], 0)
+            except:
+                import pdb; pdb.set_trace()
+            # data[key] = np.stack(data[key], 0)
         yield data
 
 
@@ -433,9 +438,17 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
             super().__init__(logits=logits, probs=probs)
 
     def mode(self):
-        _mode = F.one_hot(
-            torch.argmax(super().logits, axis=-1), super().logits.shape[-1]
-        )
+        temp = super().logits.clone()
+        # print("temp shape", temp.shape)
+        current_shape = temp.shape
+        while torch._C._functorch.is_functorch_wrapped_tensor(temp):
+            temp = torch._C._functorch.get_unwrapped(temp)
+            if temp.shape[0] == 1 and len(temp.shape) == len(current_shape) + 1:
+                temp = temp[0]
+        _mode = F.one_hot(torch.argmax(temp, axis=-1), temp.shape[-1]).reshape(current_shape)
+        # _mode = F.one_hot(
+        #     torch.argmax(super().logits, axis=-1), super().logits.shape[-1]
+        # )
         return _mode.detach() + super().logits - super().logits.detach()
 
     def sample(self, sample_shape=(), seed=None):
